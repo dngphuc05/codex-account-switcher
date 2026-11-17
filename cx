@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Run Codex with independent ChatGPT accounts, or resume a shared local thread."""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+
+ROOT = Path(os.environ.get('CX_ROOT', Path.home() / '.local/share/cx')).expanduser()
+LEGACY = Path(os.environ.get('CX_LEGACY_HOME', Path.home() / '.codex')).expanduser()
+CODEX = os.environ.get('CX_CODEX_BIN', 'codex')
+NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$')
+
+
+def fail(message):
+    raise SystemExit(f'cx: {message}')
+
+
+def account_home(name, create=False):
+    if not NAME.fullmatch(name):
+        fail('account name must contain only letters, digits, _ or -')
+    path = ROOT / 'accounts' / name
+    if create:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.chmod(0o700)
+        config = path / 'config.toml'
+        if not config.exists():
+            config.write_text('model_context_window = 500000\n')
+            config.chmod(0o600)
+    return path
+
+
+def atomic_copy(source, target):
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temp = tempfile.mkstemp(prefix='.cx-', dir=target.parent)
+    try:
+        with os.fdopen(fd, 'wb') as output, source.open('rb') as input_file:
+            shutil.copyfileobj(input_file, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temp, 0o600)
+        os.replace(temp, target)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def invoke(home, args):
+    env = os.environ.copy()
+    env['CODEX_HOME'] = str(home)
+    return subprocess.call([CODEX, *args], env=env)
+
+
+def lock_shared():
+    ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ROOT.chmod(0o700)
+    handle = (ROOT / 'shared.lock').open('a+')
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail('shared history is in use by another cx switch session')
+    return handle
+
+
+def recover_locked():
+    backup = ROOT / 'shared-backup' / 'auth.json'
+    marker = ROOT / 'shared-backup' / 'account.json'
+    if not marker.exists():
+        return False
+    if not backup.exists():
+        fail('recovery marker exists but original auth backup is missing')
+    try:
+        name = json.loads(marker.read_text())['account']
+        target = account_home(name, create=True) / 'auth.json'
+        current = LEGACY / 'auth.json'
+        if current.exists() and current.read_bytes() != backup.read_bytes():
+            atomic_copy(current, target)
+        atomic_copy(backup, current)
+        marker.unlink()
+        backup.unlink()
+        return True
+    except (OSError, ValueError, KeyError) as exc:
+        fail(f'could not recover shared credentials: {exc}')
+
+
+def switch(name, session_id, extra):
+    try:
+        uuid.UUID(session_id)
+    except ValueError:
+        fail('switch requires a conversation UUID')
+    profile_auth = account_home(name) / 'auth.json'
+    if not profile_auth.is_file():
+        fail(f'{name} is not logged in; run: cx login {name}')
+    original = LEGACY / 'auth.json'
+    if not original.is_file():
+        fail(f'{original} is missing; shared-history switch needs an existing Codex login')
+    lock = lock_shared()
+    try:
+        if recover_locked():
+            print('cx: recovered credentials from an interrupted switch', file=sys.stderr)
+        backup_dir = ROOT / 'shared-backup'
+        backup_dir.mkdir(mode=0o700, exist_ok=True)
+        backup_dir.chmod(0o700)
+        atomic_copy(original, backup_dir / 'auth.json')
+        marker = backup_dir / 'account.json'
+        marker.write_text(json.dumps({'account': name}))
+        marker.chmod(0o600)
+        try:
+            atomic_copy(profile_auth, original)
+            print(f'cx: resuming {session_id} with {name}; shared history is locked until exit', file=sys.stderr)
+            return invoke(LEGACY, ['--no-daemon', 'resume', session_id, *extra])
+        finally:
+            recover_locked()
+    finally:
+        lock.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Codex account profiles and shared-history switching')
+    sub = parser.add_subparsers(dest='command', required=True)
+    login = sub.add_parser('login', help='sign in to a separate account profile')
+    login.add_argument('account')
+    login.add_argument('--device-auth', action='store_true')
+    imported = sub.add_parser('import-current', help='copy the current ~/.codex login into a profile')
+    imported.add_argument('account')
+    status = sub.add_parser('status', help='show account login status')
+    status.add_argument('account', nargs='?')
+    run = sub.add_parser('run', help='start Codex in an isolated profile')
+    run.add_argument('account')
+    run.add_argument('args', nargs=argparse.REMAINDER)
+    resume = sub.add_parser('resume', help='resume a session in its own profile')
+    resume.add_argument('account')
+    resume.add_argument('session_id')
+    resume.add_argument('args', nargs=argparse.REMAINDER)
+    shared = sub.add_parser('switch', help='resume a shared-history UUID under another account')
+    shared.add_argument('session_id')
+    shared.add_argument('--to', dest='account', required=True)
+    sub.add_parser('recover', help='restore credentials after an interrupted switch')
+    sub.add_parser('list', help='list local profiles')
+    args = parser.parse_args()
+    if args.command == 'login':
+        home = account_home(args.account, create=True)
+        return invoke(home, ['login', *(['--device-auth'] if args.device_auth else [])])
+    if args.command == 'import-current':
+        if (ROOT / 'shared-backup' / 'account.json').exists():
+            fail('an interrupted switch needs recovery; run: cx recover')
+        source = LEGACY / 'auth.json'
+        target = account_home(args.account, create=True) / 'auth.json'
+        if not source.is_file():
+            fail(f'{source} is missing; current login may use a keyring')
+        if target.exists():
+            fail(f'{args.account} already has credentials; refusing to overwrite')
+        atomic_copy(source, target)
+        print(f'cx: imported current login as {args.account}')
+        return 0
+    if args.command == 'status':
+        if args.account:
+            return invoke(account_home(args.account, create=True), ['login', 'status'])
+        profiles = ROOT / 'accounts'
+        if not profiles.exists():
+            return 0
+        for home in sorted(profiles.iterdir()):
+            if home.is_dir() and NAME.fullmatch(home.name):
+                print(f'{home.name}:', flush=True)
+                invoke(home, ['login', 'status'])
+        return 0
+    if args.command == 'run':
+        return invoke(account_home(args.account, create=True), ['--no-daemon', *args.args])
+    if args.command == 'resume':
+        return invoke(account_home(args.account, create=True), ['--no-daemon', 'resume', args.session_id, *args.args])
+    if args.command == 'switch':
+        return switch(args.account, args.session_id, [])
+    if args.command == 'recover':
+        lock = lock_shared()
+        try:
+            print('cx: recovered' if recover_locked() else 'cx: nothing to recover')
+        finally:
+            lock.close()
+        return 0
+    if args.command == 'list':
+        profiles = ROOT / 'accounts'
+        if profiles.exists():
+            for home in sorted(profiles.iterdir()):
+                if home.is_dir() and NAME.fullmatch(home.name):
+                    print(home.name + (' (logged in)' if (home / 'auth.json').is_file() else ''))
+        return 0
+    return 2
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except OSError as exc:
+        fail(str(exc))
