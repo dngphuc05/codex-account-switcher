@@ -23,7 +23,7 @@ import os
 from pathlib import Path
 import sys
 home = Path(os.environ['CODEX_HOME'])
-if 'resume' in sys.argv and home.name == 'legacy':
+if 'resume' in sys.argv and home.name in ('legacy', 'first'):
     auth = home / 'auth.json'
     assert auth.read_text() == 'second'
     auth.write_text('refreshed')
@@ -49,10 +49,27 @@ if 'resume' in sys.argv and home.name == 'legacy':
         profile = self.root / 'accounts/second'
         profile.mkdir(parents=True)
         (profile / 'auth.json').write_text('second')
+        sessions = self.legacy / 'sessions'
+        sessions.mkdir()
+        (sessions / f'rollout-{UUID}.jsonl').write_text('')
         self.assertEqual(self.call('switch', UUID, '--to', 'second').returncode, 0)
         self.assertEqual((self.legacy / 'auth.json').read_text(), 'original')
         self.assertEqual((profile / 'auth.json').read_text(), 'refreshed')
         self.assertFalse((self.root / 'shared-backup/account.json').exists())
+
+    def test_resume_from_another_profile(self):
+        source = self.root / 'accounts/first'
+        target = self.root / 'accounts/second'
+        source.mkdir(parents=True)
+        target.mkdir(parents=True)
+        (source / 'auth.json').write_text('original')
+        (target / 'auth.json').write_text('second')
+        sessions = source / 'sessions'
+        sessions.mkdir()
+        (sessions / f'rollout-{UUID}.jsonl').write_text('')
+        self.assertEqual(self.call('resume', 'second', UUID).returncode, 0)
+        self.assertEqual((source / 'auth.json').read_text(), 'original')
+        self.assertEqual((target / 'auth.json').read_text(), 'refreshed')
 
 
 if __name__ == '__main__':

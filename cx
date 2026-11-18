@@ -68,6 +68,45 @@ def lock_shared():
     return handle
 
 
+def lock_home(home, exclusive=False):
+    locks = ROOT / 'locks'
+    locks.mkdir(parents=True, exist_ok=True, mode=0o700)
+    locks.chmod(0o700)
+    name = 'legacy' if home == LEGACY else home.name
+    handle = (locks / f'{name}.lock').open('a+')
+    mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    try:
+        fcntl.flock(handle, mode | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail(f'{name} is in use by another cx session')
+    return handle
+
+
+def invoke_locked(home, args, exclusive=False):
+    lock = lock_home(home, exclusive)
+    try:
+        return invoke(home, args)
+    finally:
+        lock.close()
+
+
+def session_home(session_id):
+    try:
+        uuid.UUID(session_id)
+    except ValueError:
+        fail('conversation ID must be a UUID')
+    homes = [LEGACY]
+    profiles = ROOT / 'accounts'
+    if profiles.exists():
+        homes.extend(path for path in profiles.iterdir() if path.is_dir() and NAME.fullmatch(path.name))
+    matches = [home for home in homes if any((home / 'sessions').rglob(f'*-{session_id}.jsonl'))]
+    if not matches:
+        fail(f'no local session found with ID {session_id}; check the ID and account')
+    if len(matches) > 1:
+        fail(f'session {session_id} exists in multiple profiles; resolve the duplicate before switching')
+    return matches[0]
+
+
 def recover_locked():
     backup = ROOT / 'shared-backup' / 'auth.json'
     marker = ROOT / 'shared-backup' / 'account.json'
@@ -78,7 +117,9 @@ def recover_locked():
     try:
         name = json.loads(marker.read_text())['account']
         target = account_home(name, create=True) / 'auth.json'
-        current = LEGACY / 'auth.json'
+        source = json.loads(marker.read_text()).get('source', 'legacy')
+        home = LEGACY if source == 'legacy' else account_home(source)
+        current = home / 'auth.json'
         if current.exists() and current.read_bytes() != backup.read_bytes():
             atomic_copy(current, target)
         atomic_copy(backup, current)
@@ -89,36 +130,46 @@ def recover_locked():
         fail(f'could not recover shared credentials: {exc}')
 
 
-def switch(name, session_id, extra):
-    try:
-        uuid.UUID(session_id)
-    except ValueError:
-        fail('switch requires a conversation UUID')
+def switch(name, session_id, extra, source_home=None):
+    source_home = source_home or session_home(session_id)
+    source = 'legacy' if source_home == LEGACY else source_home.name
     profile_auth = account_home(name) / 'auth.json'
     if not profile_auth.is_file():
         fail(f'{name} is not logged in; run: cx login {name}')
-    original = LEGACY / 'auth.json'
+    original = source_home / 'auth.json'
     if not original.is_file():
-        fail(f'{original} is missing; shared-history switch needs an existing Codex login')
+        fail(f'{original} is missing; source session needs an existing Codex login')
     lock = lock_shared()
     try:
         if recover_locked():
             print('cx: recovered credentials from an interrupted switch', file=sys.stderr)
-        backup_dir = ROOT / 'shared-backup'
-        backup_dir.mkdir(mode=0o700, exist_ok=True)
-        backup_dir.chmod(0o700)
-        atomic_copy(original, backup_dir / 'auth.json')
-        marker = backup_dir / 'account.json'
-        marker.write_text(json.dumps({'account': name}))
-        marker.chmod(0o600)
+        source_lock = lock_home(source_home, exclusive=True)
         try:
-            atomic_copy(profile_auth, original)
-            print(f'cx: resuming {session_id} with {name}; shared history is locked until exit', file=sys.stderr)
-            return invoke(LEGACY, ['--no-daemon', 'resume', session_id, *extra])
+            target_lock = lock_home(account_home(name))
+            try:
+                return switch_locked(name, session_id, extra, source_home, source, profile_auth, original)
+            finally:
+                target_lock.close()
         finally:
-            recover_locked()
+            source_lock.close()
     finally:
         lock.close()
+
+
+def switch_locked(name, session_id, extra, source_home, source, profile_auth, original):
+    backup_dir = ROOT / 'shared-backup'
+    backup_dir.mkdir(mode=0o700, exist_ok=True)
+    backup_dir.chmod(0o700)
+    atomic_copy(original, backup_dir / 'auth.json')
+    marker = backup_dir / 'account.json'
+    marker.write_text(json.dumps({'account': name, 'source': source}))
+    marker.chmod(0o600)
+    try:
+        atomic_copy(profile_auth, original)
+        print(f'cx: resuming {session_id} with {name}; shared history is locked until exit', file=sys.stderr)
+        return invoke(source_home, ['--no-daemon', 'resume', session_id, *extra])
+    finally:
+        recover_locked()
 
 
 def main():
@@ -146,7 +197,7 @@ def main():
     args = parser.parse_args()
     if args.command == 'login':
         home = account_home(args.account, create=True)
-        return invoke(home, ['login', *(['--device-auth'] if args.device_auth else [])])
+        return invoke_locked(home, ['login', *(['--device-auth'] if args.device_auth else [])], exclusive=True)
     if args.command == 'import-current':
         if (ROOT / 'shared-backup' / 'account.json').exists():
             fail('an interrupted switch needs recovery; run: cx recover')
@@ -156,7 +207,11 @@ def main():
             fail(f'{source} is missing; current login may use a keyring')
         if target.exists():
             fail(f'{args.account} already has credentials; refusing to overwrite')
-        atomic_copy(source, target)
+        lock = lock_home(account_home(args.account), exclusive=True)
+        try:
+            atomic_copy(source, target)
+        finally:
+            lock.close()
         print(f'cx: imported current login as {args.account}')
         return 0
     if args.command == 'status':
@@ -171,9 +226,13 @@ def main():
                 invoke(home, ['login', 'status'])
         return 0
     if args.command == 'run':
-        return invoke(account_home(args.account, create=True), ['--no-daemon', *args.args])
+        return invoke_locked(account_home(args.account, create=True), ['--no-daemon', *args.args])
     if args.command == 'resume':
-        return invoke(account_home(args.account, create=True), ['--no-daemon', 'resume', args.session_id, *args.args])
+        target_home = account_home(args.account, create=True)
+        source_home = session_home(args.session_id)
+        if source_home == target_home:
+            return invoke_locked(target_home, ['--no-daemon', 'resume', args.session_id, *args.args])
+        return switch(args.account, args.session_id, args.args, source_home)
     if args.command == 'switch':
         return switch(args.account, args.session_id, [])
     if args.command == 'recover':

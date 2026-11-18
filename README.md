@@ -57,7 +57,7 @@ cx run second
 
 Commands run from your current directory, so each terminal can use a different project. If both sessions will edit the same Git repository, separate worktrees help avoid conflicting edits.
 
-Resume a session in the profile where it was created:
+Resume a session by ID. `cx` finds the local profile that holds it. If you name a different account, it temporarily uses that account's credentials with the source profile's history:
 
 ```bash
 cx resume second SESSION_UUID
@@ -67,15 +67,15 @@ Arguments after the profile name are passed to Codex, for example `cx run second
 
 ## Resume an existing ID with another account
 
-For a conversation stored in the normal `~/.codex` history:
+For a conversation stored in any local profile, you can also use:
 
 ```bash
 cx switch SESSION_UUID --to second
 ```
 
-This temporarily selects `second`'s credentials in `~/.codex`, runs `codex --no-daemon resume SESSION_UUID`, then saves any refreshed credentials and restores the original login. A lock prevents two `cx switch` sessions from running together. Close other Codex processes that use `~/.codex` before switching; the lock cannot control processes launched outside `cx`.
+This finds the profile containing `SESSION_UUID`, temporarily selects `second`'s credentials in that profile, runs `codex --no-daemon resume SESSION_UUID`, then saves any refreshed credentials and restores the original login. A lock prevents two `cx switch` sessions from running together. `cx` also prevents a managed session from running in the source profile during a switch. Close Codex processes launched outside `cx` that use the source profile before switching; its lock cannot control those processes.
 
-The CLI may reject a conversation under a different account. `cx` keeps the local UUID and does not change server-side conversation ownership. Cross-account resume depends on what the Codex service permits; it is not guaranteed. Isolated profiles started with `cx run` have separate histories and cannot be switched by copying their session files.
+The CLI may reject a conversation under a different account. `cx` keeps the local UUID and does not change server-side conversation ownership. Cross-account resume depends on what the Codex service permits; it is not guaranteed. Session files are not copied between profiles.
 
 If the process or machine stops during a switch, run `cx recover` before opening normal Codex. A later `cx switch` also tries to recover automatically.
 
