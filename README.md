@@ -27,11 +27,21 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## Set up accounts
 
-If Codex is already signed in under `~/.codex`, import that login without signing in again:
+If Codex is already signed in under `~/.codex`, link a profile to that live login:
 
 ```bash
-cx import-current main
+cx link-current main
 ```
+
+The linked profile uses the same credentials and session history as normal `codex`. A later `codex login` is immediately visible to `cx run main` and `cx resume main`.
+
+If you prefer a separate copy of the current login, use:
+
+```bash
+cx import-current copy
+```
+
+After signing in again with normal `codex login`, refresh a copied profile with `cx import-current copy --replace`. Copied credentials can become stale when refresh tokens rotate; linking is recommended for the current login. Other accounts should use `cx login PROFILE` to sign in directly to their isolated profiles.
 
 Sign in to another account. Profile names are your choice: letters, digits, `_` and `-`, up to 40 characters, beginning with a letter or digit.
 

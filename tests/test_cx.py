@@ -44,6 +44,9 @@ if 'resume' in sys.argv and home.name in ('legacy', 'first'):
         self.assertEqual((self.root / 'accounts/main/auth.json').read_text(), 'original')
         self.assertEqual((self.root / 'accounts/main/config.toml').read_text(), 'model_context_window = 500000\n')
         self.assertNotEqual(self.call('import-current', 'main').returncode, 0)
+        (self.legacy / 'auth.json').write_text('new-login')
+        self.assertEqual(self.call('import-current', 'main', '--replace').returncode, 0)
+        self.assertEqual((self.root / 'accounts/main/auth.json').read_text(), 'new-login')
 
     def test_switch_restores_original_and_saves_refresh(self):
         profile = self.root / 'accounts/second'
@@ -70,6 +73,36 @@ if 'resume' in sys.argv and home.name in ('legacy', 'first'):
         self.assertEqual(self.call('resume', 'second', UUID).returncode, 0)
         self.assertEqual((source / 'auth.json').read_text(), 'original')
         self.assertEqual((target / 'auth.json').read_text(), 'refreshed')
+
+    def test_link_current_uses_live_login(self):
+        self.assertEqual(self.call('import-current', 'main').returncode, 0)
+        self.assertEqual(self.call('link-current', 'main').returncode, 0)
+        self.assertFalse((self.root / 'accounts/main/auth.json').exists())
+        self.assertEqual(self.call('run', 'main').returncode, 0)
+        self.assertEqual(self.call('import-current', 'main', '--replace').returncode, 0)
+        self.assertEqual((self.legacy / 'auth.json').read_text(), 'original')
+
+    def test_linked_profile_refreshes_live_login_after_switch(self):
+        self.assertEqual(self.call('link-current', 'main').returncode, 0)
+        source = self.root / 'accounts/first'
+        source.mkdir(parents=True)
+        (source / 'auth.json').write_text('source-login')
+        sessions = source / 'sessions'
+        sessions.mkdir()
+        (sessions / f'rollout-{UUID}.jsonl').write_text('')
+        self.stub.write_text('''#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+home = Path(os.environ['CODEX_HOME'])
+assert home.name == 'first'
+auth = home / 'auth.json'
+assert auth.read_text() == 'original'
+auth.write_text('refreshed')
+''')
+        self.assertEqual(self.call('resume', 'main', UUID).returncode, 0)
+        self.assertEqual((source / 'auth.json').read_text(), 'source-login')
+        self.assertEqual((self.legacy / 'auth.json').read_text(), 'refreshed')
 
 
 if __name__ == '__main__':

@@ -22,7 +22,7 @@ def fail(message):
     raise SystemExit(f'cx: {message}')
 
 
-def account_home(name, create=False):
+def profile_dir(name, create=False):
     if not NAME.fullmatch(name):
         fail('account name must contain only letters, digits, _ or -')
     path = ROOT / 'accounts' / name
@@ -34,6 +34,11 @@ def account_home(name, create=False):
             config.write_text('model_context_window = 500000\n')
             config.chmod(0o600)
     return path
+
+
+def account_home(name, create=False):
+    path = profile_dir(name, create)
+    return LEGACY if (path / 'current-home.link').exists() else path
 
 
 def atomic_copy(source, target):
@@ -132,6 +137,8 @@ def recover_locked():
 
 def switch(name, session_id, extra, source_home=None):
     source_home = source_home or session_home(session_id)
+    if source_home == account_home(name):
+        return invoke_locked(source_home, ['--no-daemon', 'resume', session_id, *extra])
     source = 'legacy' if source_home == LEGACY else source_home.name
     profile_auth = account_home(name) / 'auth.json'
     if not profile_auth.is_file():
@@ -145,7 +152,7 @@ def switch(name, session_id, extra, source_home=None):
             print('cx: recovered credentials from an interrupted switch', file=sys.stderr)
         source_lock = lock_home(source_home, exclusive=True)
         try:
-            target_lock = lock_home(account_home(name))
+            target_lock = lock_home(account_home(name), exclusive=True)
             try:
                 return switch_locked(name, session_id, extra, source_home, source, profile_auth, original)
             finally:
@@ -180,6 +187,9 @@ def main():
     login.add_argument('--device-auth', action='store_true')
     imported = sub.add_parser('import-current', help='copy the current ~/.codex login into a profile')
     imported.add_argument('account')
+    imported.add_argument('--replace', action='store_true', help='replace a saved login after signing in with codex login')
+    linked = sub.add_parser('link-current', help='use the current ~/.codex login and sessions directly')
+    linked.add_argument('account')
     status = sub.add_parser('status', help='show account login status')
     status.add_argument('account', nargs='?')
     run = sub.add_parser('run', help='start Codex in an isolated profile')
@@ -202,17 +212,40 @@ def main():
         if (ROOT / 'shared-backup' / 'account.json').exists():
             fail('an interrupted switch needs recovery; run: cx recover')
         source = LEGACY / 'auth.json'
-        target = account_home(args.account, create=True) / 'auth.json'
+        home = account_home(args.account, create=True)
+        if home == LEGACY:
+            print(f'cx: {args.account} already uses the current login')
+            return 0
+        target = home / 'auth.json'
         if not source.is_file():
             fail(f'{source} is missing; current login may use a keyring')
-        if target.exists():
-            fail(f'{args.account} already has credentials; refusing to overwrite')
-        lock = lock_home(account_home(args.account), exclusive=True)
+        lock = lock_home(home, exclusive=True)
         try:
+            if target.exists() and not args.replace:
+                fail(f'{args.account} already has credentials; use --replace to update it')
             atomic_copy(source, target)
         finally:
             lock.close()
-        print(f'cx: imported current login as {args.account}')
+        print(f'cx: saved current login as {args.account}')
+        return 0
+    if args.command == 'link-current':
+        source = LEGACY / 'auth.json'
+        if not source.is_file():
+            fail(f'{source} is missing; sign in with codex login first')
+        home = profile_dir(args.account, create=True)
+        if (home / 'current-home.link').exists():
+            print(f'cx: {args.account} already uses the current login')
+            return 0
+        if any((home / 'sessions').rglob('*.jsonl')):
+            fail(f'{args.account} has its own sessions; refusing to hide them')
+        lock = lock_home(home, exclusive=True)
+        try:
+            (home / 'current-home.link').write_text('legacy\n')
+            (home / 'current-home.link').chmod(0o600)
+            (home / 'auth.json').unlink(missing_ok=True)
+        finally:
+            lock.close()
+        print(f'cx: {args.account} now uses the current Codex login')
         return 0
     if args.command == 'status':
         if args.account:
@@ -247,7 +280,10 @@ def main():
         if profiles.exists():
             for home in sorted(profiles.iterdir()):
                 if home.is_dir() and NAME.fullmatch(home.name):
-                    print(home.name + (' (logged in)' if (home / 'auth.json').is_file() else ''))
+                    linked = (home / 'current-home.link').exists()
+                    auth = LEGACY / 'auth.json' if linked else home / 'auth.json'
+                    label = ' (current login)' if linked else (' (logged in)' if auth.is_file() else '')
+                    print(home.name + label)
         return 0
     return 2
 
