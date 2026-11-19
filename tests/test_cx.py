@@ -1,4 +1,5 @@
 import os
+import fcntl
 from pathlib import Path
 import subprocess
 import tempfile
@@ -73,6 +74,21 @@ if 'resume' in sys.argv and home.name in ('legacy', 'first'):
         self.assertEqual(self.call('resume', 'second', UUID).returncode, 0)
         self.assertEqual((source / 'auth.json').read_text(), 'original')
         self.assertEqual((target / 'auth.json').read_text(), 'refreshed')
+
+    def test_unrelated_switch_ignores_old_global_lock(self):
+        source = self.root / 'accounts/first'
+        target = self.root / 'accounts/second'
+        source.mkdir(parents=True)
+        target.mkdir(parents=True)
+        (source / 'auth.json').write_text('original')
+        (target / 'auth.json').write_text('second')
+        sessions = source / 'sessions'
+        sessions.mkdir()
+        (sessions / f'rollout-{UUID}.jsonl').write_text('')
+        old_lock = self.root / 'shared.lock'
+        with old_lock.open('a+') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            self.assertEqual(self.call('resume', 'second', UUID).returncode, 0)
 
     def test_link_current_uses_live_login(self):
         self.assertEqual(self.call('import-current', 'main').returncode, 0)

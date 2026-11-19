@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run Codex with independent ChatGPT accounts, or resume a shared local thread."""
 import argparse
+from contextlib import ExitStack
 import fcntl
 import json
 import os
@@ -112,9 +113,10 @@ def session_home(session_id):
     return matches[0]
 
 
-def recover_locked():
-    backup = ROOT / 'shared-backup' / 'auth.json'
-    marker = ROOT / 'shared-backup' / 'account.json'
+def recover_locked(backup_dir=None):
+    backup_dir = backup_dir or ROOT / 'shared-backup'
+    backup = backup_dir / 'auth.json'
+    marker = backup_dir / 'account.json'
     if not marker.exists():
         return False
     if not backup.exists():
@@ -146,26 +148,20 @@ def switch(name, session_id, extra, source_home=None):
     original = source_home / 'auth.json'
     if not original.is_file():
         fail(f'{original} is missing; source session needs an existing Codex login')
-    lock = lock_shared()
-    try:
-        if recover_locked():
-            print('cx: recovered credentials from an interrupted switch', file=sys.stderr)
-        source_lock = lock_home(source_home, exclusive=True)
-        try:
-            target_lock = lock_home(account_home(name), exclusive=True)
-            try:
-                return switch_locked(name, session_id, extra, source_home, source, profile_auth, original)
-            finally:
-                target_lock.close()
-        finally:
-            source_lock.close()
-    finally:
-        lock.close()
+    backup_dir = ROOT / 'backups' / source
+    with ExitStack() as stack:
+        for home in sorted({source_home, account_home(name)}, key=str):
+            stack.enter_context(lock_home(home, exclusive=True))
+        marker = backup_dir / 'account.json'
+        if marker.exists() and json.loads(marker.read_text()).get('account') != name:
+            fail(f'interrupted switch in {source}; run: cx recover')
+        if recover_locked(backup_dir):
+            print(f'cx: recovered credentials for {source}', file=sys.stderr)
+        return switch_locked(name, session_id, extra, source_home, source, profile_auth, original, backup_dir)
 
 
-def switch_locked(name, session_id, extra, source_home, source, profile_auth, original):
-    backup_dir = ROOT / 'shared-backup'
-    backup_dir.mkdir(mode=0o700, exist_ok=True)
+def switch_locked(name, session_id, extra, source_home, source, profile_auth, original, backup_dir):
+    backup_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
     backup_dir.chmod(0o700)
     atomic_copy(original, backup_dir / 'auth.json')
     marker = backup_dir / 'account.json'
@@ -173,10 +169,10 @@ def switch_locked(name, session_id, extra, source_home, source, profile_auth, or
     marker.chmod(0o600)
     try:
         atomic_copy(profile_auth, original)
-        print(f'cx: resuming {session_id} with {name}; shared history is locked until exit', file=sys.stderr)
+        print(f'cx: resuming {session_id} with {name}; {source} is locked until exit', file=sys.stderr)
         return invoke(source_home, ['--no-daemon', 'resume', session_id, *extra])
     finally:
-        recover_locked()
+        recover_locked(backup_dir)
 
 
 def main():
@@ -256,7 +252,7 @@ def main():
         for home in sorted(profiles.iterdir()):
             if home.is_dir() and NAME.fullmatch(home.name):
                 print(f'{home.name}:', flush=True)
-                invoke(home, ['login', 'status'])
+                invoke(account_home(home.name), ['login', 'status'])
         return 0
     if args.command == 'run':
         return invoke_locked(account_home(args.account, create=True), ['--no-daemon', *args.args])
@@ -269,11 +265,26 @@ def main():
     if args.command == 'switch':
         return switch(args.account, args.session_id, [])
     if args.command == 'recover':
+        recovered = False
+        backups = ROOT / 'backups'
+        if backups.exists():
+            for backup_dir in sorted(backups.iterdir()):
+                marker = backup_dir / 'account.json'
+                if not marker.exists():
+                    continue
+                data = json.loads(marker.read_text())
+                source = data['source']
+                source_home = LEGACY if source == 'legacy' else profile_dir(source)
+                with ExitStack() as stack:
+                    for home in sorted({source_home, account_home(data['account'])}, key=str):
+                        stack.enter_context(lock_home(home, exclusive=True))
+                    recovered = recover_locked(backup_dir) or recovered
         lock = lock_shared()
         try:
-            print('cx: recovered' if recover_locked() else 'cx: nothing to recover')
+            recovered = recover_locked() or recovered
         finally:
             lock.close()
+        print('cx: recovered' if recovered else 'cx: nothing to recover')
         return 0
     if args.command == 'list':
         profiles = ROOT / 'accounts'

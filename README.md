@@ -83,7 +83,7 @@ For a conversation stored in any local profile, you can also use:
 cx switch SESSION_UUID --to second
 ```
 
-This finds the profile containing `SESSION_UUID`, temporarily selects `second`'s credentials in that profile, runs `codex --no-daemon resume SESSION_UUID`, then saves any refreshed credentials and restores the original login. A lock prevents two `cx switch` sessions from running together. `cx` also prevents a managed session from running in the source profile during a switch. Close Codex processes launched outside `cx` that use the source profile before switching; its lock cannot control those processes.
+This finds the profile containing `SESSION_UUID`, temporarily selects `second`'s credentials in that profile, runs `codex --no-daemon resume SESSION_UUID`, then saves any refreshed credentials and restores the original login. `cx` locks only the source and destination profiles while switching, so unrelated profiles can run at the same time. Close Codex processes launched outside `cx` that use either profile before switching; its locks cannot control those processes.
 
 The CLI may reject a conversation under a different account. `cx` keeps the local UUID and does not change server-side conversation ownership. Cross-account resume depends on what the Codex service permits; it is not guaranteed. Session files are not copied between profiles.
 
@@ -92,7 +92,7 @@ If the process or machine stops during a switch, run `cx recover` before opening
 ## Storage and configuration
 
 - `~/.local/share/cx/accounts/PROFILE/`: credentials and session history for each isolated profile
-- `~/.local/share/cx/shared-backup/`: temporary private credential backup during `cx switch`
+- `~/.local/share/cx/backups/SOURCE/`: temporary private credential backup during `cx switch`
 - `~/.codex/`: existing Codex home used by shared-history switching
 
 New profiles start with `model_context_window = 500000` in their `config.toml`. You can edit that value per profile. The actual usable window depends on the selected model and service.
